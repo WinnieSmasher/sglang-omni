@@ -10,6 +10,7 @@ import uuid
 from collections.abc import AsyncIterator
 from contextvars import ContextVar
 
+from sglang_omni.admission import ContextExhaustedError
 from sglang_omni.serve.realtime.control import (
     Accepted,
     Cleared,
@@ -19,6 +20,7 @@ from sglang_omni.serve.realtime.control import (
     Drained,
     Ended,
     Failure,
+    ImageAccepted,
     UnitCompleted,
     Updated,
 )
@@ -44,6 +46,7 @@ from sglang_omni.serve.realtime.types import (
 
 logger = logging.getLogger(__name__)
 
+MAX_FRAME_LOOKAHEAD_UNITS = 2
 MAX_FAILURE_MESSAGE_CHARS = 512
 MEDIA_TIME_TOLERANCE_MS = 1e-7
 
@@ -74,6 +77,7 @@ class SessionRuntime:
         self.discarded_samples = 0
         self.padding_samples = 0
         self.pending_pcm = bytearray()
+        self.pending_frames: dict[int, list[tuple[float, bytes]]] = {}
         self.next_unit_index = 0
         self.is_input_ended = False
         self.end_event_id: str | None = None
@@ -81,6 +85,7 @@ class SessionRuntime:
         self.input_ready = asyncio.Event()
         self.output_buffer = OutputBuffer(limits)
         self.pump_task: asyncio.Task[None] | None = None
+        self.update_deadline_task: asyncio.Task[None] | None = None
         self.close_task: asyncio.Task[None] | None = None
         self.processing_unit: ContextVar[Unit | None] = ContextVar(
             "realtime_unit", default=None
@@ -95,6 +100,22 @@ class SessionRuntime:
 
     def notify_created(self) -> None:
         self.notify(Created(self.session_id, self.model, "realtime"))
+        self.update_deadline_task = asyncio.create_task(self.expire_without_update())
+
+    async def expire_without_update(self) -> None:
+        """Free the connection slot of a session that never opens; cancelled on OPEN."""
+        await asyncio.sleep(self.limits.session_update_timeout_s)
+        async with self.command_lock:
+            if self.state == "CREATED":
+                # Note (Yucheng Hu): Fence under the lock so a late session.update is
+                # rejected instead of starting an admission before run_close runs.
+                self.state = "CLOSING"
+                self.fail(
+                    f"session not opened within {self.limits.session_update_timeout_s:g} s",
+                    "session_update_timeout",
+                )
+            else:
+                pass
 
     async def outputs(self) -> AsyncIterator[Envelope]:
         while True:
@@ -165,9 +186,21 @@ class SessionRuntime:
                     pass
                 self.state = "OPEN"
                 self.pump_task = asyncio.create_task(self.pump())
+                if self.update_deadline_task is not None:
+                    self.update_deadline_task.cancel()
+                else:
+                    pass
             else:
                 pass
             self.config, self.granted = candidate, granted
+            public_config = {
+                **candidate,
+                "sglang": {
+                    key: value
+                    for key, value in candidate.get("sglang", {}).items()
+                    if key not in ("reference_audio", "tts_reference_audio")
+                },
+            }
             self.notify(
                 Updated(
                     self.session_id,
@@ -175,7 +208,7 @@ class SessionRuntime:
                     candidate["type"],
                     granted,
                     event_id,
-                    copy.deepcopy(candidate),
+                    copy.deepcopy(public_config),
                 )
             )
 
@@ -225,12 +258,51 @@ class SessionRuntime:
             )
             self.input_ready.set()
 
+    async def append_image(self, image: bytes, t_ms: float, event_id: str) -> None:
+        async with self.command_lock:
+            self.require_open()
+            pending_start_ms = self.capabilities.input_duration_ms(
+                self.accepted_samples - self.pending_samples
+            )
+            pending_unit_offset = math.floor(
+                (t_ms - pending_start_ms) / self.capabilities.native_unit_ms
+            )
+            unit_index = self.next_unit_index + pending_unit_offset
+            pending_units = math.ceil(
+                len(self.pending_pcm) / self.capabilities.native_unit_bytes
+            )
+            if "image" not in self.capabilities.input_modalities:
+                raise ProtocolError("not_supported", "image input is not granted")
+            elif self.is_input_ended:
+                raise ProtocolError("invalid_state", "input has ended")
+            elif len(image) > self.capabilities.max_image_bytes:
+                raise ProtocolError(
+                    "buffer_overflow", "image exceeds input budget", "image"
+                )
+            elif not image.startswith((b"\xff\xd8", b"\x89PNG")):
+                raise ProtocolError(
+                    "invalid_request", "image must be JPEG or PNG", "image"
+                )
+            elif unit_index < self.next_unit_index:
+                raise ProtocolError("invalid_state", "frame unit already cut")
+            elif (
+                len(self.pending_frames.get(unit_index, ()))
+                >= self.granted["input_image_format"]["max_frames_per_unit"]
+            ):
+                raise ProtocolError("buffer_overflow", "unit frame count exceeds limit")
+            elif pending_unit_offset > pending_units + MAX_FRAME_LOOKAHEAD_UNITS:
+                raise ProtocolError("buffer_overflow", "frame exceeds lookahead budget")
+            else:
+                self.pending_frames.setdefault(unit_index, []).append((t_ms, image))
+                self.notify(ImageAccepted(f"unit_{unit_index}", event_id))
+
     async def clear(self, event_id: str) -> None:
         async with self.command_lock:
             self.require_open()
             assert self.adapter is not None
             cleared_samples = self.pending_samples + await self.adapter.clear()
             self.pending_pcm.clear()
+            self.pending_frames.clear()
             self.discarded_samples += cleared_samples
             self.notify(
                 Cleared(self.capabilities.input_duration_ms(cleared_samples), event_id)
@@ -284,6 +356,13 @@ class SessionRuntime:
             real_samples,
             self.is_input_ended and not self.pending_pcm,
             tuple(self.granted["output_modalities"]),
+            images=tuple(
+                image
+                for _, image in sorted(
+                    self.pending_frames.pop(self.next_unit_index, []),
+                    key=lambda frame: frame[0],
+                )
+            ),
         )
         self.next_unit_index += 1
         return unit
@@ -354,8 +433,15 @@ class SessionRuntime:
         except ProtocolError as exc:
             self.fail(str(exc), exc.code)
         except Exception as exc:
-            logger.exception(f"Realtime session {self.session_id} input pump failed")
-            self.fail(str(exc))
+            if ContextExhaustedError.matches(exc):
+                logger.error(f"Realtime session {self.session_id} closed: {exc}")
+                failure_code = ContextExhaustedError.CODE
+            else:
+                logger.exception(
+                    f"Realtime session {self.session_id} input pump failed"
+                )
+                failure_code = "internal"
+            self.fail(str(exc), failure_code)
 
     def fail(
         self, message: str, code: str = "internal", event_id: str | None = None
@@ -380,6 +466,7 @@ class SessionRuntime:
         # teardown can run a VAD callback that must observe CLOSING.
         async with self.command_lock:
             self.state = "CLOSING"
+            self.pending_frames.clear()
         self.discarded_samples += self.pending_samples
         self.pending_pcm.clear()
         self.input_ready.set()
@@ -396,7 +483,8 @@ class SessionRuntime:
         finally:
             try:
                 await cancel_local_tasks(
-                    [self.pump_task], self.limits.cleanup_timeout_s
+                    [self.pump_task, self.update_deadline_task],
+                    self.limits.cleanup_timeout_s,
                 )
             except Exception as exc:
                 cleanup_error = cleanup_error or exc

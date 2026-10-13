@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -21,10 +22,13 @@ from sglang_omni.models.moss_transcribe_diarize.stages import (
     missing_additional_chat_templates_compat,
 )
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
+from sglang_omni.preprocessing.audio import decode_audio_bytes
 from sglang_omni.scheduling.generation_batch_policy import (
     build_default_prefill_cuda_graph_bs,
     build_generation_batch_overrides,
 )
+from sglang_omni.serve.server_warmup import TranscriptionWarmupRequest
+from sglang_omni.utils.imports import import_string
 
 
 def make_moss_engine_builder() -> MossTranscribeDiarizeEngineBuilder:
@@ -283,6 +287,40 @@ def test_compile_encoder_drops_bucket_whose_warmup_fails(
     assert model.compiled_chunk_buckets == frozenset({1})
 
 
+def test_init_encoder_graphs_uses_platform_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from sglang_omni.models.moss_transcribe_diarize import sglang_model
+
+    backend = object()
+    get_graph_backend = Mock(return_value=backend)
+    graph_runner = Mock()
+
+    monkeypatch.setattr(
+        sglang_model.current_platform,
+        "get_device_graph_backend",
+        get_graph_backend,
+    )
+    monkeypatch.setattr(sglang_model, "WhisperEncoderCudaGraphRunner", graph_runner)
+
+    encoder = torch.nn.Linear(4, 4)
+    model = SimpleNamespace(
+        whisper_encoder=encoder,
+        encoder_graph_runner=None,
+        config=SimpleNamespace(audio_config=SimpleNamespace(num_mel_bins=80)),
+    )
+
+    sglang_model.MossTranscribeDiarizeForConditionalGeneration.init_encoder_graphs(
+        model, [2, 1], input_feature_len=3000
+    )
+
+    get_graph_backend.assert_called_once_with(next(encoder.parameters()).device)
+    assert graph_runner.call_args.kwargs["graph_backend"] is backend
+    graph_runner.return_value.capture.assert_called_once_with([2, 1])
+
+
 def stub_factory_env(monkeypatch: pytest.MonkeyPatch, *, want_cuda_graph: bool):
     from types import SimpleNamespace
 
@@ -512,3 +550,13 @@ def test_processor_compat_preserves_non_template_repo_errors(
     with missing_additional_chat_templates_compat():
         with pytest.raises(RepositoryNotFoundError, match="missing-repo"):
             processing_utils.list_repo_templates("missing-repo", local_files_only=False)
+
+
+def test_server_warmup_request_is_a_second_of_audio_to_transcribe() -> None:
+    config = MossTranscribeDiarizePipelineConfig(model_path="dummy")
+    request = import_string(config.server_warmup_request_factory)(config)
+
+    audio, sample_rate = decode_audio_bytes(request.wav_bytes)
+
+    assert isinstance(request, TranscriptionWarmupRequest)
+    assert (len(audio), sample_rate, request.max_new_tokens) == (16000, 16000, 8)
