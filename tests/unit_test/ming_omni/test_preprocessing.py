@@ -45,7 +45,9 @@ def fake_load_ming_tokenizer(model_path: str) -> FakeMingTokenizer:
     return FakeMingTokenizer()
 
 
-def build_preprocessor(monkeypatch: pytest.MonkeyPatch) -> preprocessor.MingPreprocessor:
+def build_preprocessor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> preprocessor.MingPreprocessor:
     """Build a real preprocessor with only the checkpoint loaders stubbed out."""
     # note (WinnieSmasher): checkpoint loading is stubbed but the processor lookup
     # runs for real, so a renamed Transformers symbol fails here instead of at
